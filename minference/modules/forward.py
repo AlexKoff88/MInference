@@ -1,6 +1,7 @@
 # Copyright (c) 2024 Microsoft
 # Licensed under The MIT License [see LICENSE for details]
 
+import torch
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.models.llama.modeling_llama import *
 
@@ -32,6 +33,9 @@ def attn_forward(
     output_attentions = False
 
     bsz, q_len, _ = hidden_states.size()
+
+    # if self.layer_idx == 0:
+    #     print("attn_forward is called with: ", position_ids.size() if position_ids.size(-1) > 1 else position_ids)
 
     if "q_proj" in self.__dict__["_modules"]:
         query_states = self.q_proj(hidden_states)
@@ -109,13 +113,61 @@ def attn_forward(
                 "layer_idx": self.layer_idx,
                 "attn_forward_config": attn_forward_config,
             }
-            attn_output = prefill_forward(  # [bsz, num_heads, q_len, head_dim]
-                query_states,
-                key_states,
-                value_states,
-                prefill_kwargs,
-            )
-            attn_output = attn_output.transpose(1, 2).contiguous()
+
+
+            #===================================================================
+            CHUNKED_PREFILL = True
+            if CHUNKED_PREFILL:
+                query_states = query_states.transpose(1, 2)
+                key_states = key_states.transpose(1, 2)
+                value_states = value_states.transpose(1, 2)
+                CHUNK_SIZE = 512
+                PREFIX_SIZE = 128
+                MIN_CHUNK_SIZE = prefill_kwargs["attn_forward_config"]["n_init"] + prefill_kwargs["attn_forward_config"]["n_last"]
+                attn_outputs = []
+
+                chunk_start = 0
+                while chunk_start < q_len:
+                    chunk_end = min(chunk_start + CHUNK_SIZE, q_len)             
+
+                    if q_len - chunk_end < MIN_CHUNK_SIZE:
+                        chunk_end = q_len
+
+                    if chunk_start > 0:
+                        forward_fn = prefill_forward if chunk_end == q_len else a_shape_kernel
+                        attn_output = forward_fn(  # [bsz, num_heads, q_len, head_dim]
+                            torch.cat((query_states[:, :PREFIX_SIZE], query_states[:, chunk_start:chunk_end]), dim=1).transpose(1, 2),
+                            torch.cat((key_states[:, :PREFIX_SIZE], key_states[:, chunk_start:chunk_end]), dim=1).transpose(1, 2),
+                            torch.cat((value_states[:, :PREFIX_SIZE], value_states[:, chunk_start:chunk_end]), dim=1).transpose(1, 2),
+                            prefill_kwargs,
+                        )
+                        attn_outputs.append(attn_output.transpose(1, 2)[:, PREFIX_SIZE:])
+                    else:
+                        attn_output = a_shape_kernel(  # [bsz, num_heads, q_len, head_dim]
+                            query_states[:, chunk_start:chunk_end].transpose(1, 2),
+                            key_states[:, chunk_start:chunk_end].transpose(1, 2),
+                            value_states[:, chunk_start:chunk_end].transpose(1, 2),
+                            prefill_kwargs,
+                        )
+                        attn_outputs.append(attn_output.transpose(1, 2))
+
+                    chunk_start = chunk_end
+
+                attn_output = torch.cat(attn_outputs, dim=1)
+                query_states = query_states.transpose(1, 2)
+                key_states = key_states.transpose(1, 2)
+                value_states = value_states.transpose(1, 2)
+            else:
+                attn_output = prefill_forward(  # [bsz, num_heads, q_len, head_dim]
+                        query_states,
+                        key_states,
+                        value_states,
+                        prefill_kwargs,
+                    )
+                attn_output = attn_output.transpose(1, 2).contiguous()
+
+            if self.layer_idx == 0:
+                print(attn_output.shape)
 
         else:  # if not specified, use flash attention
             attn_output = _flash_attention_forward(  # [bsz, q_len, num_heads, head_dim]
