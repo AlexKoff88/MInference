@@ -123,12 +123,14 @@ def attn_forward(
                 value_states = value_states.transpose(1, 2)
                 CHUNK_SIZE = 512
                 PREFIX_SIZE = 128
+                MIN_CHUNK_SIZE = prefill_kwargs["attn_forward_config"]["n_init"] + prefill_kwargs["attn_forward_config"]["n_last"]
                 attn_outputs = []
 
                 chunk_start = 0
                 while chunk_start < q_len:
-                    chunk_end = min(chunk_start + CHUNK_SIZE, q_len)
-                    if q_len - chunk_end < 128:
+                    chunk_end = min(chunk_start + CHUNK_SIZE, q_len)             
+
+                    if q_len - chunk_end < MIN_CHUNK_SIZE:
                         chunk_end = q_len
 
                     if chunk_start > 0:
